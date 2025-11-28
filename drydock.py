@@ -17,6 +17,7 @@ from rich.layout import Layout
 from rich.text import Text
 from rich.prompt import Confirm
 import re
+import sys
 
 console = Console()
 CONFIG_PATH = Path.home() / ".config" / "drydock" / "config.yml"
@@ -434,6 +435,6 @@ if __name__ == "__main__":
 
     if args.show_config_path:
         console.print(f"Config file path is: [bold cyan]{CONFIG_PATH}[/bold cyan]")
-        exit(0)
+        sys.exit(0)
 
     asyncio.run(run_ui(args))
