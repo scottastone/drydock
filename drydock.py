@@ -287,8 +287,8 @@ async def run_ui(args):
     # Live Table function
     def generate_table():
         table = Table(show_header=True, header_style="bold magenta", expand=True)
-        table.add_column("Service", style="cyan", width=30)
-        table.add_column("Status", justify="center")
+        table.add_column("Service", style="cyan", no_wrap=True, min_width=25)
+        table.add_column("Status", justify="center", width=20)
 
         active = [s for s in services if s["status"] in ["Pulling...", "Deploying..."]]
 
