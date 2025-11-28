@@ -6,6 +6,9 @@
 # Exit immediately if a command exits with a non-zero status.
 set -e
 
+echo "Entering venv..."
+source .venv/bin/activate
+
 echo "🚀 Starting the build process for drydock..."
 
 # 1. Build the executable using PyInstaller
