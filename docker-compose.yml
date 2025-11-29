@@ -1,0 +1,24 @@
+version: '3.8'
+
+services:
+  drydock:
+    build: .
+    image: drydock-updater
+    container_name: drydock
+    restart: unless-stopped
+    volumes:
+      # Mount the Docker socket to allow this container to manage other containers on the host
+      - /var/run/docker.sock:/var/run/docker.sock
+
+      # Mount your main docker compose directory into the container.
+      # The script's config `path` should point to `/docker/compose`.
+      - ~/docker/compose:/docker/compose
+    environment:
+      # Add a comma-separated list of service directory names to ignore.
+      # These are in addition to the 'ignore' list in config.yml.
+      DRYDOCK_IGNORE: "portainer,another-service-to-ignore"
+    command:
+      # This command will run when the container starts.
+      # It will update all services without asking for confirmation.
+      # Add --dry-run here to test.
+      - "--path=/docker/compose"

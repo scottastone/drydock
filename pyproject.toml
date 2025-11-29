@@ -10,4 +10,5 @@ dependencies = [
     "pytest-cov>=7.0.0",
     "pyyaml>=6.0.3",
     "rich>=14.2.0",
+    "docker>=7.0.0",
 ]

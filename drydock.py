@@ -18,6 +18,8 @@ from rich.text import Text
 from rich.prompt import Confirm
 import re
 import sys
+import os
+import docker
 
 console = Console()
 CONFIG_PATH = Path.home() / ".config" / "drydock" / "config.yml"
@@ -26,14 +28,16 @@ CONFIG_PATH = Path.home() / ".config" / "drydock" / "config.yml"
 def create_default_config():
     """Creates a default configuration file if one does not exist."""
     CONFIG_PATH.parent.mkdir(parents=True, exist_ok=True)
+    cpu_core_count = os.cpu_count() or 1
 
-    default_config_content = """
+    # The default config will use half of your available cores.
+    default_config_content = f"""
 # Default path to your main docker compose directory.
 # Tilde (~) is supported for your home directory.
 path: "~/docker/compose"
 
 # Default number of concurrent jobs to run.
-max_concurrent_jobs: 10
+max_concurrent_jobs: {cpu_core_count // 2}
 
 # A list of service directory names to skip entirely.
 ignore:
@@ -70,7 +74,7 @@ def load_config():
 
 
 class ServiceUpdater:
-    def __init__(self, root_path, max_concurrent, dry_run=False, confirm=False):
+    def __init__(self, root_path, max_concurrent, dry_run=False, confirm=False, force_pull=False):
         self.root_path = Path(root_path)
         self.semaphore = asyncio.Semaphore(max_concurrent)
         self.dry_run = dry_run
@@ -78,6 +82,16 @@ class ServiceUpdater:
         self.results = []
         self.failed_services = []
 
+        self.force_pull = force_pull
+
+        try:
+            # Initialize the Docker client from the environment
+            self.client = docker.from_env()
+            self.client.ping()  # Check if the Docker daemon is responsive
+        except docker.errors.DockerException as e:
+            console.print(f"[bold red]Error connecting to Docker daemon:[/bold red] {e}")
+            console.print("Please ensure Docker is running.")
+            sys.exit(1)
     async def get_services(self):
         """Finds all folders containing a docker-compose.yml"""
         services = []
@@ -92,6 +106,8 @@ class ServiceUpdater:
                     "status": "Waiting",
                     "color": "dim",
                     "update_info": "",
+                    "old_digest": None,
+                    "new_digest": None,
                 }
             )
         return services
@@ -103,6 +119,87 @@ class ServiceUpdater:
         )
         stdout, stderr = await proc.communicate()
         return proc.returncode, stdout.decode(), stderr.decode()
+
+    async def is_image_up_to_date(self, service):
+        """Checks if the docker image for a service is up-to-date using the Docker Python library."""
+        compose_file_path = service["path"] / "docker-compose.yml"
+        if not compose_file_path.exists():
+            return False, "Compose file not found"
+
+        try:
+            with open(compose_file_path, "r") as f:
+                compose_config = yaml.safe_load(f)
+
+            if not compose_config or "services" not in compose_config:
+                return False, "Invalid compose file"
+
+            all_service_configs = compose_config.get("services", {})
+            if not all_service_configs:
+                return False, "No services found in compose file"
+
+            # Iterate through all services defined in the file.
+            # If any service is not up-to-date, we must pull for the whole stack.
+            for service_name, service_config in all_service_configs.items():
+                # If a service uses 'build' or has no 'image', we can't check it.
+                # We must assume it might need an update.
+                if "image" not in service_config:
+                    return False, f"Service '{service_name}' uses build, not image"
+
+                # Expand environment variables in the image name (e.g., ${TAG})
+                image_name = os.path.expandvars(service_config["image"])
+
+                # If no tag is specified, Docker defaults to 'latest'. We should do the same.
+                if ":" not in Path(image_name).name:
+                    image_name = f"{image_name}:latest"
+
+                # --- Pinned Version Check ---
+                tag = image_name.split(":")[-1]
+                if tag != "latest":
+                    try:
+                        self.client.images.get(image_name)
+                        # This pinned version exists locally, so we can continue to the next service.
+                        continue
+                    except docker.errors.ImageNotFound:
+                        # A pinned version is missing, so we must pull.
+                        return False, f"Pinned version for '{service_name}' not found locally"
+
+                # --- Remote Digest Check for 'latest' tag ---
+                loop = asyncio.get_running_loop()
+                is_latest, reason = await loop.run_in_executor(
+                    None, self._check_image_digests, image_name
+                )
+
+                if not is_latest:
+                    # This image is not up-to-date, so the whole stack needs a pull.
+                    return False, f"Image for '{service_name}' is not up-to-date"
+
+            # If we get here, it means the loop completed without finding any
+            # services that needed an update. The entire stack is up-to-date.
+            return True, "All services in stack are up-to-date"
+
+        except (yaml.YAMLError, KeyError, IndexError, docker.errors.APIError) as e:
+            return False, f"Error during check: {e}"
+
+    def _check_image_digests(self, image_name):
+        """Synchronous helper to check image digests. Meant to be run in an executor."""
+        try:
+            # 1. Get the remote digest first. This is the source of truth.
+            remote_data = self.client.images.get_registry_data(image_name)
+            remote_digest = remote_data.attrs["Descriptor"]["digest"]
+
+            # 2. Get the local image and check if its RepoDigests contains the remote digest.
+            local_image = self.client.images.get(image_name)
+            repo_digests = local_image.attrs.get("RepoDigests", [])
+            if not repo_digests:
+                # Local image exists but has no RepoDigests (e.g., it was only built, not pulled).
+                # We can't be sure it's the same, so we should update.
+                return False, "Local image has no RepoDigest"
+
+            return any(remote_digest in d for d in repo_digests), "Checked"
+        except docker.errors.APIError as e:
+            return False, f"API Error checking registry: {e}"
+        except docker.errors.ImageNotFound:
+            return False, "Image not found locally"
 
     async def update_service(self, service, progress, task_id, live):
         async with self.semaphore:
@@ -134,6 +231,34 @@ class ServiceUpdater:
                     progress.advance(task_id)
                     return
 
+            # Check if image is already up-to-date
+            if not self.force_pull:
+                service["status"] = "Checking..."
+                service["color"] = "blue"
+                is_latest, reason = await self.is_image_up_to_date(service)
+                if is_latest:
+                    service["status"] = "Up-to-date"
+                    service["color"] = "dim"
+                    progress.advance(task_id)
+                    return  # This was the missing return statement
+
+            # --- Capture pre-update state for final report ---
+            try:
+                # We need to find the specific image name from the compose file again
+                with open(service["path"] / "docker-compose.yml", "r") as f:
+                    compose_config = yaml.safe_load(f)
+                if compose_config and "services" in compose_config:
+                    # This logic assumes single-service-per-file or that the first service is representative
+                    first_service_config = list(compose_config["services"].values())[0]
+                    if "image" in first_service_config:
+                        image_name = os.path.expandvars(first_service_config["image"])
+                        if ":" not in Path(image_name).name:
+                            image_name += ":latest"
+                        local_image = self.client.images.get(image_name)
+                        service["old_digest"] = local_image.short_id
+            except (docker.errors.ImageNotFound, FileNotFoundError, KeyError, IndexError):
+                service["old_digest"] = "Not present"
+
             service["status"] = "Pulling..."
             service["color"] = "blue"
 
@@ -157,13 +282,6 @@ class ServiceUpdater:
                 service["status"] = "Pull Failed"
                 service["color"] = "red"
                 self.failed_services.append({"service": service, "error": err})
-                progress.advance(task_id)
-                return
-
-            # Check if anything was actually updated
-            if "Image is up to date" in out and "Pulled" not in out:
-                service["status"] = "Up-to-date"
-                service["color"] = "dim"
                 progress.advance(task_id)
                 return
 
@@ -191,6 +309,17 @@ class ServiceUpdater:
                 service["status"] = "Updated"
                 service["color"] = "green"
             else:
+                # --- Capture post-update state for final report ---
+                try:
+                    # Re-fetch image name as before
+                    if "image" in first_service_config:
+                        image_name = os.path.expandvars(first_service_config["image"])
+                        if ":" not in Path(image_name).name:
+                            image_name += ":latest"
+                        latest_image = self.client.images.get(image_name)
+                        service["new_digest"] = latest_image.short_id
+                except (docker.errors.ImageNotFound, NameError):
+                    pass # Couldn't get new digest, but that's ok
                 service["status"] = "Up Failed"
                 service["color"] = "red"
                 self.failed_services.append({"service": service, "error": err})
@@ -214,6 +343,7 @@ async def run_ui(args):
         max_concurrent=int(max_jobs),
         dry_run=args.dry_run,
         confirm=args.confirm,
+        force_pull=args.force_pull,
     )
     all_services_found = await updater.get_services()
 
@@ -221,32 +351,39 @@ async def run_ui(args):
         console.print("[red]No docker-compose.yml files found![/red]")
         return
 
-    # Filter out ignored services
-    ignore_list = config.get("ignore", [])
+    # Filter out ignored services from config file
+    ignore_list = set(config.get("ignore", []))
+
+    # Augment with ignored services from environment variable
+    ignore_from_env = os.environ.get("DRYDOCK_IGNORE", "")
+    if ignore_from_env:
+        ignore_list_from_env = [item.strip() for item in ignore_from_env.split(",")]
+        ignore_list.update(ignore_list_from_env)
+
+    # Get services to defer from config
+    defer_list = set(config.get("defer_last", []))
+
     services = []
+    deferred_services = []
     ignored_services = []
     for s in all_services_found:
         if s["name"] in ignore_list:
             ignored_services.append(s)
+        elif s["name"] in defer_list:
+            deferred_services.append(s)
         else:
             services.append(s)
+
+    # Add deferred services to the end of the list
+    services.extend(deferred_services)
 
     if ignored_services:
         console.print(
             f"[yellow]Ignoring {len(ignored_services)} services based on config: [dim]{', '.join(s['name'] for s in ignored_services)}[/dim][/yellow]"
         )
-
-    # Defer pihole to be last to avoid DNS issues for other containers
-    pihole_service = None
-    for i, s in enumerate(services):
-        if s["name"] == "pihole":
-            pihole_service = services.pop(i)
-            break
-
-    if pihole_service:
-        services.append(pihole_service)
+    if deferred_services:
         console.print(
-            "[cyan]INFO:[/] Service [bold]pihole[/bold] will be updated last to preserve DNS resolution."
+            f"[cyan]INFO:[/] The following services will be updated last: [bold]{', '.join(s['name'] for s in deferred_services)}[/bold]"
         )
 
     # Create the layout
@@ -291,10 +428,12 @@ async def run_ui(args):
         table.add_column("Service", style="cyan", no_wrap=True, min_width=25)
         table.add_column("Status", justify="center", width=20)
 
-        active = [s for s in services if s["status"] in ["Pulling...", "Deploying..."]]
+        # Show services that are actively being worked on.
+        active_statuses = ["Pulling...", "Deploying...", "Checking..."]
+        active = [s for s in services if s["status"] in active_statuses]
 
         # Add active rows
-        for s in active:
+        for s in sorted(active, key=lambda x: x["name"]):
             table.add_row(s["name"], f"[{s['color']}]{s['status']}[/{s['color']}]")
 
         # Fill rest with dots if empty so layout doesn't collapse
@@ -308,8 +447,9 @@ async def run_ui(args):
         completed = sum(1 for s in services if s["status"] == "Updated")
         failed = len(updater.failed_services)
         waiting = sum(1 for s in services if s["status"] == "Waiting")
+        skipped = sum(1 for s in services if s["status"] in ["Skipped", "Up-to-date"])
         return Panel(
-            f"[green]Success: {completed}[/green]  |  [red]Failed: {failed}[/red]  |  [dim]Waiting: {waiting}[/dim]",
+            f"[green]Success: {completed}[/green]  |  [red]Failed: {failed}[/red]  |  [yellow]Skipped: {skipped}[/yellow]  |  [dim]Waiting: {waiting}[/dim]",
             title="Status",
         )
 
@@ -320,10 +460,6 @@ async def run_ui(args):
             while not job_progress.finished:
                 layout["main"].update(generate_table())
                 layout["footer"].update(generate_footer())
-                # Render the progress bar into the layout?
-                # Ideally we mix them, but for simplicity, we'll print progress above.
-                # Actually, let's put progress IN the footer or header.
-                # Rich Live allows updating renderables.
                 title = f"[bold yellow]⚓ drydock | processing {max_jobs} at a time[/bold yellow]"
                 if args.dry_run:
                     title += " ([bold yellow]DRY RUN[/bold yellow])"
@@ -337,10 +473,15 @@ async def run_ui(args):
             for s in services
         ]
 
-        # Run view updater and tasks concurrently
-        await asyncio.gather(asyncio.gather(*update_tasks), update_view())
+        # Run view updater and service update tasks concurrently
+        await asyncio.gather(*update_tasks, update_view())
 
-    # Final Report
+        # Perform one final refresh to ensure the footer is up-to-date
+        layout["main"].update(generate_table())
+        layout["footer"].update(generate_footer())
+        live.refresh()
+
+    # Final Report, printed after the Live display has stopped.
     console.print("\n[bold]✨ Update Complete ✨[/bold]")
 
     updated_services = [s for s in services if s["status"] == "Updated"]
@@ -350,20 +491,13 @@ async def run_ui(args):
         )
         for service in updated_services:
             console.print(f"✅ [bold]{service['name']}[/bold]")
-            # Print the docker compose pull output which shows version info
-            update_info = service.get("update_info")
-            if update_info:
-                pulled_images = parse_pulled_images(update_info)
-                if pulled_images:
-                    summary = "\n".join(
-                        f"  • Pulled [cyan]{image}[/cyan]" for image in pulled_images
-                    )
-                    console.print(summary)
-                else:
-                    # Fallback in case parsing fails, though unlikely with current logic.
-                    console.print(
-                        Panel(update_info.strip(), border_style="dim", expand=False)
-                    )
+            # Show version change if available
+            old_digest = service.get("old_digest")
+            new_digest = service.get("new_digest")
+            if old_digest and new_digest and old_digest != new_digest:
+                console.print(
+                    f"   [dim]Updated from {old_digest} →[/dim] [bold cyan]{new_digest}[/bold cyan]"
+                )
 
     up_to_date_services = [s["name"] for s in services if s["status"] == "Up-to-date"]
     if up_to_date_services:
@@ -425,6 +559,11 @@ if __name__ == "__main__":
         "--confirm",
         action="store_true",
         help="Ask for confirmation before updating each service.",
+    )
+    parser.add_argument(
+        "--force-pull",
+        action="store_true",
+        help="Force a pull of all images, skipping the up-to-date check.",
     )
     parser.add_argument(
         "--show-config-path",

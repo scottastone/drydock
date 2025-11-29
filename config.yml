@@ -2,20 +2,22 @@
 
 # Default path to your main docker compose directory.
 # Tilde (~) is supported for your home directory.
-path: "~/docker/compose"
+# When running in Docker, this should be the path inside the container.
+path: "/docker/compose"
 
 # Default number of concurrent jobs to run.
 # Use as many as you want - depending on the number of CPU cores.
 max_concurrent_jobs: 10
 
 # A list of service directory names to skip entirely.
+# This list can be extended by setting the DRYDOCK_IGNORE environment variable
+# in your docker-compose.yml (as a comma-separated string).
 ignore:
-  - my-custom-app
-  - another-local-service
-  - dev-environment
+  - drydock 
+  - pihole
+  - unbound
 
 # A list of services to update last.
-# Useful for critical infrastructure like DNS servers.
-# Note: The current script hardcodes 'pihole', but this is how you'd make it configurable.
+# Useful for critical infrastructure like DNS servers (e.g., pihole).
 defer_last:
   - pihole
