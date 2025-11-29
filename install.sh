@@ -6,10 +6,10 @@
 # Exit immediately if a command exits with a non-zero status.
 set -e
 
-echo "Entering venv..."
+echo "--> Entering venv..."
 source .venv/bin/activate
 
-echo "🚀 Starting the build process for drydock..."
+echo "--> Starting the build process for drydock..."
 
 # 1. Build the executable using PyInstaller
 #    --onefile: Bundles everything into a single executable.
@@ -24,7 +24,7 @@ INSTALL_DIR="$HOME/.local/bin"
 EXECUTABLE_NAME="drydock"
 SOURCE_FILE="dist/$EXECUTABLE_NAME"
 
-echo "🚀 Installing '$EXECUTABLE_NAME' to '$INSTALL_DIR'..."
+echo "--> Installing '$EXECUTABLE_NAME' to '$INSTALL_DIR'..."
 
 # Create the installation directory if it doesn't exist
 mkdir -p "$INSTALL_DIR"
@@ -35,7 +35,8 @@ mv "$SOURCE_FILE" "$INSTALL_DIR/"
 echo "✅ Installation complete."
 
 # 3. Clean up build artifacts
-echo "🚀 Cleaning up build files..."
+echo "--> Cleaning up build files..."
 rm -rf build/ dist/ drydock.spec
 
 echo "✨ All done! You can now run 'drydock' from anywhere in your terminal."
+deactivate
