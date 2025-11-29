@@ -53,6 +53,7 @@ defer_last:
         f.write(default_config_content.strip())
 
     console.print(f"📄 Created default config file at [bold cyan]{CONFIG_PATH}[/bold cyan]")
+    console.print(f"Using {cpu_core_count // 2} cores by default (found a total of {cpu_core_count} cores). You can edit this in the config file.")
     # Load and return the newly created config
     return yaml.safe_load(default_config_content)
 
