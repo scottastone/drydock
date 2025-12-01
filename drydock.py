@@ -52,8 +52,12 @@ defer_last:
     with open(CONFIG_PATH, "w") as f:
         f.write(default_config_content.strip())
 
-    console.print(f"📄 Created default config file at [bold cyan]{CONFIG_PATH}[/bold cyan]")
-    console.print(f"Using {cpu_core_count // 2} cores by default (found a total of {cpu_core_count} cores). You can edit this in the config file.")
+    console.print(
+        f"📄 Created default config file at [bold cyan]{CONFIG_PATH}[/bold cyan]"
+    )
+    console.print(
+        f"Using {cpu_core_count // 2} cores by default (found a total of {cpu_core_count} cores). You can edit this in the config file."
+    )
     # Load and return the newly created config
     return yaml.safe_load(default_config_content)
 
@@ -72,10 +76,17 @@ def load_config():
             f"[bold red]Error loading config file {CONFIG_PATH}:[/bold red] {e}"
         )
         return {}
+    except Exception as e:
+        console.print(
+            f"[bold red]Unexpected error loading config file {CONFIG_PATH}:[/bold red] {e}"
+        )
+        return {}
 
 
 class ServiceUpdater:
-    def __init__(self, root_path, max_concurrent, dry_run=False, confirm=False, force_pull=False):
+    def __init__(
+        self, root_path, max_concurrent, dry_run=False, confirm=False, force_pull=False
+    ):
         self.root_path = Path(root_path)
         self.semaphore = asyncio.Semaphore(max_concurrent)
         self.dry_run = dry_run
@@ -90,9 +101,12 @@ class ServiceUpdater:
             self.client = docker.from_env()
             self.client.ping()  # Check if the Docker daemon is responsive
         except docker.errors.DockerException as e:
-            console.print(f"[bold red]Error connecting to Docker daemon:[/bold red] {e}")
+            console.print(
+                f"[bold red]Error connecting to Docker daemon:[/bold red] {e}"
+            )
             console.print("Please ensure Docker is running.")
             sys.exit(1)
+
     async def get_services(self):
         """Finds all folders containing a docker-compose.yml"""
         services = []
@@ -162,7 +176,10 @@ class ServiceUpdater:
                         continue
                     except docker.errors.ImageNotFound:
                         # A pinned version is missing, so we must pull.
-                        return False, f"Pinned version for '{service_name}' not found locally"
+                        return (
+                            False,
+                            f"Pinned version for '{service_name}' not found locally",
+                        )
 
                 # --- Remote Digest Check for 'latest' tag ---
                 loop = asyncio.get_running_loop()
@@ -257,7 +274,12 @@ class ServiceUpdater:
                             image_name += ":latest"
                         local_image = self.client.images.get(image_name)
                         service["old_digest"] = local_image.short_id
-            except (docker.errors.ImageNotFound, FileNotFoundError, KeyError, IndexError):
+            except (
+                docker.errors.ImageNotFound,
+                FileNotFoundError,
+                KeyError,
+                IndexError,
+            ):
                 service["old_digest"] = "Not present"
 
             service["status"] = "Pulling..."
@@ -320,7 +342,7 @@ class ServiceUpdater:
                         latest_image = self.client.images.get(image_name)
                         service["new_digest"] = latest_image.short_id
                 except (docker.errors.ImageNotFound, NameError):
-                    pass # Couldn't get new digest, but that's ok
+                    pass  # Couldn't get new digest, but that's ok
                 service["status"] = "Up Failed"
                 service["color"] = "red"
                 self.failed_services.append({"service": service, "error": err})
