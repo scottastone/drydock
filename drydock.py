@@ -17,6 +17,7 @@ from rich.layout import Layout
 from rich.text import Text
 from rich.prompt import Confirm
 import re
+import shutil
 import sys
 import os
 import docker
@@ -82,6 +83,20 @@ def load_config():
         )
         return {}
 
+def save_config(config):
+    """Saves the configuration to the YAML file."""
+    try:
+        CONFIG_PATH.parent.mkdir(parents=True, exist_ok=True)
+        with open(CONFIG_PATH, "w") as f:
+            yaml.dump(config, f, default_flow_style=False, sort_keys=False)
+    except (IOError, yaml.YAMLError) as e:
+        console.print(
+            f"[bold red]Error saving config file {CONFIG_PATH}:[/bold red] {e}"
+        )
+    except Exception as e:
+        console.print(
+            f"[bold red]Unexpected error saving config file {CONFIG_PATH}:[/bold red] {e}"
+        )
 
 class ServiceUpdater:
     def __init__(
@@ -224,25 +239,27 @@ class ServiceUpdater:
             if self.dry_run:
                 service["status"] = "Dry Run"
                 service["color"] = "cyan"
-                live.stop()
-                console.print(
-                    f"[cyan]DRY-RUN:[/] Would update [bold]{service['name']}[/bold] at {service['path']}"
-                )
-                live.start()
+                if live:
+                    live.stop()
+                    console.print(
+                        f"[cyan]DRY-RUN:[/] Would update [bold]{service['name']}[/bold] at {service['path']}"
+                    )
+                    live.start()
 
                 await asyncio.sleep(0.2)  # Simulate work
-                progress.advance(task_id)
+                if progress:
+                    progress.advance(task_id)
                 return
 
             if self.confirm:
                 # Pause the live display to ask for confirmation
-                live.stop()
+                if live: live.stop()
                 should_update = Confirm.ask(
                     f"Update service [bold cyan]{service['name']}[/bold cyan]?",
                     default=True,
                     console=console,
                 )
-                live.start()
+                if live: live.start()
                 if not should_update:
                     service["status"] = "Skipped"
                     service["color"] = "yellow"
@@ -257,7 +274,8 @@ class ServiceUpdater:
                 if is_latest:
                     service["status"] = "Up-to-date"
                     service["color"] = "dim"
-                    progress.advance(task_id)
+                    if progress:
+                        progress.advance(task_id)
                     return  # This was the missing return statement
 
             # --- Capture pre-update state for final report ---
@@ -273,7 +291,7 @@ class ServiceUpdater:
                         if ":" not in Path(image_name).name:
                             image_name += ":latest"
                         local_image = self.client.images.get(image_name)
-                        service["old_digest"] = local_image.short_id
+                        service["old_digest"] = local_image.short_id.replace("sha256:", "")[:12]
             except (
                 docker.errors.ImageNotFound,
                 FileNotFoundError,
@@ -305,7 +323,8 @@ class ServiceUpdater:
                 service["status"] = "Pull Failed"
                 service["color"] = "red"
                 self.failed_services.append({"service": service, "error": err})
-                progress.advance(task_id)
+                if progress:
+                    progress.advance(task_id)
                 return
 
             # Store pull output for final report
@@ -331,7 +350,6 @@ class ServiceUpdater:
             if code == 0:
                 service["status"] = "Updated"
                 service["color"] = "green"
-            else:
                 # --- Capture post-update state for final report ---
                 try:
                     # Re-fetch image name as before
@@ -340,14 +358,17 @@ class ServiceUpdater:
                         if ":" not in Path(image_name).name:
                             image_name += ":latest"
                         latest_image = self.client.images.get(image_name)
-                        service["new_digest"] = latest_image.short_id
+                        service["new_digest"] = latest_image.short_id.replace("sha256:", "")[:12]
                 except (docker.errors.ImageNotFound, NameError):
                     pass  # Couldn't get new digest, but that's ok
-                service["status"] = "Up Failed"
-                service["color"] = "red"
-                self.failed_services.append({"service": service, "error": err})
 
-            progress.advance(task_id)
+                if code != 0:
+                    service["status"] = "Up Failed"
+                    service["color"] = "red"
+                    self.failed_services.append({"service": service, "error": err})
+
+            if progress:
+                progress.advance(task_id)
 
 
 async def run_ui(args):
@@ -355,7 +376,84 @@ async def run_ui(args):
     config = load_config()
 
     # Determine configuration with precedence: CLI > config file > default
-    compose_root = args.path or config.get("path") or "/home/scott/docker/compose/"
+    compose_root = args.path or config.get("path") or "~/docker/compose"
+    
+    # --- New Service Discovery ---
+    if not args.dry_run:
+        try:
+            client = docker.from_env()
+            running_containers = client.containers.list()
+            untracked_projects = {}
+
+            # Ensure compose_root is absolute for path comparisons
+            abs_compose_root = Path(compose_root).expanduser().resolve()
+            
+            # Get current ignore list to avoid re-prompting
+            current_ignore_list = set(config.get("ignore", []))
+
+            for container in running_containers:
+                project_name = container.labels.get("com.docker.compose.project")
+                config_files = container.labels.get("com.docker.compose.project.config_files")
+
+                if project_name and config_files and project_name not in current_ignore_list:
+                    # The label can contain multiple files, we care about the first one
+                    compose_path = Path(config_files.split(',')[0])
+                    
+                    if not compose_path.resolve().is_relative_to(abs_compose_root):
+                        if project_name not in untracked_projects:
+                             untracked_projects[project_name] = compose_path.parent
+
+            if untracked_projects:
+                console.print("\n[bold yellow]🔎 Found untracked running services:[/bold yellow]")
+                for name, path in untracked_projects.items():
+                    console.print(f"  - [bold cyan]{name}[/bold cyan] at [dim]{path}[/dim]")
+                
+                if Confirm.ask("\nDo you want to manage these services with Drydock?", default=True):
+                    for name, path in untracked_projects.items():
+                        console.print(f"\n--- Managing [bold cyan]{name}[/bold cyan] ---")
+                        if Confirm.ask(f"Move [bold cyan]{name}[/bold cyan] to the Drydock directory and start tracking it?", default=True):
+                            # Move the directory
+                            destination = abs_compose_root / name
+                            try:
+                                shutil.move(str(path), str(destination))
+                                console.print(f"✅ Moved service to [dim]{destination}[/dim]")
+
+                                # Ask to defer
+                                if Confirm.ask("Should this service be updated last (deferred)?", default=False):
+                                    defer_list = config.get("defer_last", [])
+                                    if name not in defer_list:
+                                        defer_list.append(name)
+                                        config["defer_last"] = defer_list
+                                        console.print(f"📝 Added [bold cyan]{name}[/bold cyan] to the defer list.")
+                                    
+                                save_config(config)
+
+                            except Exception as e:
+                                console.print(f"[bold red]Error moving directory for {name}:[/bold red] {e}")
+                        else:
+                            # Add to ignore list
+                            ignore_list = config.get("ignore", [])
+                            if name not in ignore_list:
+                                ignore_list.append(name)
+                                config["ignore"] = ignore_list
+                                save_config(config)
+                                console.print(f"📝 Added [bold cyan]{name}[/bold cyan] to the ignore list in your config.")
+                else:
+                    # User chose not to manage any of the found services. Add all to ignore list.
+                    ignore_list = config.get("ignore", [])
+                    newly_ignored_count = 0
+                    for name in untracked_projects.keys():
+                        if name not in ignore_list:
+                            ignore_list.append(name)
+                            newly_ignored_count += 1
+                    if newly_ignored_count > 0:
+                        config["ignore"] = ignore_list
+                        save_config(config)
+                        console.print(f"\n📝 Added {newly_ignored_count} services to the ignore list in your config.")
+                    console.print("\n[bold green]Discovery complete. Continuing with updates...[/bold green]\n")
+        except docker.errors.DockerException as e:
+            console.print(f"[bold red]Could not scan for new services:[/bold red] {e}")
+
     # Ensure compose_root is a Path object
     compose_root = Path(compose_root).expanduser()
 
@@ -399,6 +497,41 @@ async def run_ui(args):
 
     # Add deferred services to the end of the list
     services.extend(deferred_services)
+
+    if args.quiet:
+        # --- Quiet Mode Execution ---
+        if not services:
+            console.print("[dim]No services to update.[/dim]")
+            return
+
+        console.print(f"Checking {len(services)} services...")
+        update_tasks = [
+            updater.update_service(s, None, None, None) for s in services
+        ]
+        await asyncio.gather(*update_tasks)
+
+        # --- Quiet Final Report ---
+        updated_services = [s for s in services if s["status"] == "Updated"]
+        up_to_date_services = [s for s in services if s["status"] == "Up-to-date"]
+        skipped_services = [s for s in services if s["status"] == "Skipped"]
+        failed_services = updater.failed_services
+
+        total_attempted = len(services) - len(up_to_date_services) - len(skipped_services)
+
+        console.print(
+            f"✨ Done. Attempted: {total_attempted}, Successful: {len(updated_services)}, Skipped: {len(up_to_date_services) + len(skipped_services)}, Failed: {len(failed_services)}"
+        )
+
+        if updated_services:
+            console.print("\n[bold green]Successful updates:[/bold green]")
+            for service in updated_services:
+                console.print(f"  ✅ {service['name']}")
+
+        if failed_services:
+            console.print("\n[bold red]Failed services:[/bold red]")
+            for failure in failed_services:
+                console.print(f"  ❌ {failure['service']['name']}")
+        return
 
     if ignored_services:
         console.print(
@@ -448,7 +581,8 @@ async def run_ui(args):
     # Live Table function
     def generate_table():
         table = Table(show_header=True, header_style="bold magenta", expand=True)
-        table.add_column("Service", style="cyan", no_wrap=True, min_width=25)
+        table.add_column("Service", style="cyan", no_wrap=True, min_width=20)
+        table.add_column("Image ID", style="dim", width=15)
         table.add_column("Status", justify="center", width=20)
 
         # Show services that are actively being worked on.
@@ -457,11 +591,12 @@ async def run_ui(args):
 
         # Add active rows
         for s in sorted(active, key=lambda x: x["name"]):
-            table.add_row(s["name"], f"[{s['color']}]{s['status']}[/{s['color']}]")
+            image_id = s.get("old_digest") or ""
+            table.add_row(s["name"], image_id, f"[{s['color']}]{s['status']}[/{s['color']}]")
 
         # Fill rest with dots if empty so layout doesn't collapse
         if not active:
-            table.add_row("[dim]Worker pool idle...[/dim]", "")
+            table.add_row("[dim]Worker pool idle...[/dim]", "", "")
 
         return Panel(table, title="Active Workers")
 
@@ -492,7 +627,7 @@ async def run_ui(args):
                 await asyncio.sleep(0.1)
 
         update_tasks = [
-            updater.update_service(s, job_progress, overall_task, live)
+            updater.update_service(s, job_progress, overall_task, live) if not args.quiet else updater.update_service(s, None, None, None)
             for s in services
         ]
 
@@ -593,7 +728,12 @@ if __name__ == "__main__":
         action="store_true",
         help="Show the path to the config file and exit.",
     )
-    args = parser.parse_args()
+    parser.add_argument(
+        "--quiet", "-q",
+        action="store_true",
+        help="Show a more minimal output, skipping the UI.",
+    )
+    args = parser.parse_args()    
 
     if args.show_config_path:
         console.print(f"Config file path is: [bold cyan]{CONFIG_PATH}[/bold cyan]")
